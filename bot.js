@@ -8,6 +8,65 @@ const { XMLParser } = require('fast-xml-parser');
 const POSTED_FILE = './posted.json';
 const SENATE_DEDUPE_FILE = path.join(__dirname, 'senate-posted.json');
 
+async function fetchJson(url, label) {
+  const response = await fetch(url, {
+    headers: { 'User-Agent': 'bill-on-the-floor-bot/1.0' },
+  });
+
+  if (!response.ok) {
+    throw new Error(`${label} returned HTTP ${response.status}`);
+  }
+
+  return response.json();
+}
+
+async function resolveDid(identifier) {
+  if (identifier.startsWith('did:')) return identifier;
+
+  const url = `https://public.api.bsky.app/xrpc/com.atproto.identity.resolveHandle?handle=${encodeURIComponent(identifier)}`;
+  const data = await fetchJson(url, 'ATProto handle resolver');
+
+  if (!data.did) {
+    throw new Error(`Could not resolve DID for ${identifier}`);
+  }
+
+  return data.did;
+}
+
+async function loadDidDocument(did) {
+  if (did.startsWith('did:plc:')) {
+    return fetchJson(`https://plc.directory/${encodeURIComponent(did)}`, 'PLC directory');
+  }
+
+  if (did.startsWith('did:web:')) {
+    const host = did.slice('did:web:'.length).replace(/:/g, '/');
+    return fetchJson(`https://${host}/.well-known/did.json`, 'did:web document');
+  }
+
+  throw new Error(`Unsupported DID method: ${did}`);
+}
+
+async function resolveAtprotoService(identifier) {
+  if (process.env.ATPROTO_SERVICE) {
+    return process.env.ATPROTO_SERVICE.replace(/\/$/, '');
+  }
+
+  const did = await resolveDid(identifier);
+  const didDocument = await loadDidDocument(did);
+  const services = Array.isArray(didDocument.service) ? didDocument.service : [];
+  const pds = services.find((service) =>
+    service &&
+    (service.id === '#atproto_pds' || service.type === 'AtprotoPersonalDataServer') &&
+    typeof service.serviceEndpoint === 'string'
+  );
+
+  if (!pds) {
+    throw new Error(`No ATProto PDS service found in DID document for ${did}`);
+  }
+
+  return pds.serviceEndpoint.replace(/\/$/, '');
+}
+
 function loadPosted() {
   if (!fs.existsSync(POSTED_FILE)) return {};
   return JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8'));
@@ -329,10 +388,18 @@ async function runSenate(bot) {
 
 async function main() {
   const mode = process.argv[2] || 'both';
+  const identifier = process.env.BLUESKY_HANDLE;
 
-  const bot = new Bot({ service: 'https://blacksky.app' });
+  if (!identifier || !process.env.BLUESKY_APP_PASSWORD) {
+    throw new Error('BLUESKY_HANDLE and BLUESKY_APP_PASSWORD are required');
+  }
+
+  const service = await resolveAtprotoService(identifier);
+  console.log(`Using ATProto PDS: ${service}`);
+
+  const bot = new Bot({ service });
   await bot.login({
-    identifier: process.env.BLUESKY_HANDLE,
+    identifier,
     password: process.env.BLUESKY_APP_PASSWORD,
   });
 
@@ -348,4 +415,7 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error('Bill on the Floor failed:', err);
+  process.exit(1);
+});
