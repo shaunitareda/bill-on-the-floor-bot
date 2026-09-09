@@ -5,6 +5,7 @@ node_modules/
 posted.json
 senate-posted.json
 senate-posted-backup.json
+.bot.lock
 
 # Runtime logs
 *.log
