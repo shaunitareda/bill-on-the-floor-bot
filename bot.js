@@ -5,8 +5,112 @@ const crypto = require('crypto');
 const { Bot } = require('@skyware/bot');
 const { XMLParser } = require('fast-xml-parser');
 
-const POSTED_FILE = './posted.json';
+const POSTED_FILE = path.join(__dirname, 'posted.json');
 const SENATE_DEDUPE_FILE = path.join(__dirname, 'senate-posted.json');
+const LOCK_FILE = path.join(__dirname, '.bot.lock');
+const LOCK_STALE_MS = 30 * 60 * 1000;
+const DEFAULT_POST_DELAY_MS = 15000;
+const DEFAULT_MAX_POSTS_PER_RUN = 5;
+
+function readPositiveInt(name, fallback) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const value = Number.parseInt(raw, 10);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a positive integer`);
+  }
+  return value;
+}
+
+const POST_DELAY_MS = readPositiveInt('POST_DELAY_MS', DEFAULT_POST_DELAY_MS);
+const MAX_POSTS_PER_RUN = readPositiveInt('MAX_POSTS_PER_RUN', DEFAULT_MAX_POSTS_PER_RUN);
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function acquireLock() {
+  try {
+    const fd = fs.openSync(LOCK_FILE, 'wx');
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
+    fs.closeSync(fd);
+    return;
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+
+  let stale = false;
+  try {
+    const stat = fs.statSync(LOCK_FILE);
+    stale = Date.now() - stat.mtimeMs > LOCK_STALE_MS;
+  } catch (err) {
+    if (err.code === 'ENOENT') return acquireLock();
+    throw err;
+  }
+
+  if (stale) {
+    console.warn('Removing stale bot lock older than 30 minutes.');
+    fs.unlinkSync(LOCK_FILE);
+    return acquireLock();
+  }
+
+  throw new Error('Another Bill on the Floor process is already running; refusing to overlap.');
+}
+
+function releaseLock() {
+  try {
+    fs.unlinkSync(LOCK_FILE);
+  } catch (err) {
+    if (err.code !== 'ENOENT') console.error('Failed to remove bot lock:', err.message);
+  }
+}
+
+function loadRequiredJson(file, label, validator) {
+  if (!fs.existsSync(file)) {
+    throw new Error(`${label} is missing at ${file}. Refusing to post without dedupe state.`);
+  }
+
+  let data;
+  try {
+    data = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`${label} is unreadable or corrupt: ${err.message}`);
+  }
+
+  if (!validator(data)) {
+    throw new Error(`${label} has an unexpected format. Refusing to post without valid dedupe state.`);
+  }
+
+  return data;
+}
+
+function createPostLimiter(bot) {
+  let postedThisRun = 0;
+  let lastPostAt = 0;
+
+  return {
+    async post(text, label) {
+      if (postedThisRun >= MAX_POSTS_PER_RUN) {
+        console.warn(`Post limit reached (${MAX_POSTS_PER_RUN}); leaving remaining items for a later run.`);
+        return false;
+      }
+
+      const elapsed = Date.now() - lastPostAt;
+      if (lastPostAt && elapsed < POST_DELAY_MS) {
+        await sleep(POST_DELAY_MS - elapsed);
+      }
+
+      await bot.post({ text });
+      postedThisRun += 1;
+      lastPostAt = Date.now();
+      console.log(`${label} (${postedThisRun}/${MAX_POSTS_PER_RUN} this run)`);
+      return true;
+    },
+    get count() {
+      return postedThisRun;
+    },
+  };
+}
 
 async function fetchJson(url, label) {
   const response = await fetch(url, {
@@ -68,8 +172,9 @@ async function resolveAtprotoService(identifier) {
 }
 
 function loadPosted() {
-  if (!fs.existsSync(POSTED_FILE)) return {};
-  return JSON.parse(fs.readFileSync(POSTED_FILE, 'utf8'));
+  return loadRequiredJson(POSTED_FILE, 'House dedupe state', (value) =>
+    value && typeof value === 'object' && !Array.isArray(value)
+  );
 }
 
 function savePosted(posted) {
@@ -133,7 +238,7 @@ function truncate(str, max) {
   return str.slice(0, max - 1) + '\u2026';
 }
 
-async function runHouse(bot, posted) {
+async function runHouse(postLimiter, posted) {
   const events = await getFloorEvents();
 
   for (const event of events) {
@@ -158,8 +263,8 @@ async function runHouse(bot, posted) {
       300
     );
 
-    await bot.post({ text: postText });
-    console.log(`Posted House ${key}`);
+    const didPost = await postLimiter.post(postText, `Posted House ${key}`);
+    if (!didPost) return;
 
     posted[key] = { postedAt: new Date().toISOString() };
     savePosted(posted);
@@ -167,14 +272,8 @@ async function runHouse(bot, posted) {
 }
 
 function loadSenatePostedKeys() {
-  if (!fs.existsSync(SENATE_DEDUPE_FILE)) return new Set();
-  try {
-    const raw = fs.readFileSync(SENATE_DEDUPE_FILE, 'utf8');
-    return new Set(JSON.parse(raw));
-  } catch (err) {
-    console.error('Failed to read Senate dedupe file, starting fresh:', err.message);
-    return new Set();
-  }
+  const data = loadRequiredJson(SENATE_DEDUPE_FILE, 'Senate dedupe state', Array.isArray);
+  return new Set(data);
 }
 
 function saveSenatePostedKeys(keysSet) {
@@ -332,7 +431,7 @@ function buildSenatePostText(item) {
   return `${voteTag}${item.docnum}: ${shortTitle}\n\nAction: ${action}\n\nBill: ${item.congressLink}\nWatch: ${item.cspanLink}`;
 }
 
-async function runSenate(bot) {
+async function runSenate(postLimiter) {
   const xml = await fetchSenateFeed();
   if (!xml) {
     console.log('No Senate floor feed available for today, yesterday, or the day before.');
@@ -376,9 +475,8 @@ async function runSenate(bot) {
       };
 
       const postText = buildSenatePostText(item);
-
-      await bot.post({ text: postText });
-      console.log(`Posted Senate ${bill.docnum}`);
+      const didPost = await postLimiter.post(postText, `Posted Senate ${bill.docnum}`);
+      if (!didPost) return;
 
       postedKeys.add(key);
       saveSenatePostedKeys(postedKeys);
@@ -387,35 +485,51 @@ async function runSenate(bot) {
 }
 
 async function main() {
-  const mode = process.argv[2] || 'both';
-  const identifier = process.env.BLUESKY_HANDLE;
+  acquireLock();
 
-  if (!identifier || !process.env.BLUESKY_APP_PASSWORD) {
-    throw new Error('BLUESKY_HANDLE and BLUESKY_APP_PASSWORD are required');
+  try {
+    const mode = process.argv[2] || 'both';
+    const identifier = process.env.BLUESKY_HANDLE;
+
+    if (!['house', 'senate', 'both'].includes(mode)) {
+      throw new Error(`Unsupported mode: ${mode}`);
+    }
+
+    if (!identifier || !process.env.BLUESKY_APP_PASSWORD) {
+      throw new Error('BLUESKY_HANDLE and BLUESKY_APP_PASSWORD are required');
+    }
+
+    if (mode === 'house' || mode === 'both') loadPosted();
+    if (mode === 'senate' || mode === 'both') loadSenatePostedKeys();
+
+    const service = await resolveAtprotoService(identifier);
+    console.log(`Using ATProto PDS: ${service}`);
+    console.log(`Safety limits: max ${MAX_POSTS_PER_RUN} posts/run, ${POST_DELAY_MS} ms minimum between posts.`);
+
+    const bot = new Bot({ service });
+    await bot.login({
+      identifier,
+      password: process.env.BLUESKY_APP_PASSWORD,
+    });
+
+    const postLimiter = createPostLimiter(bot);
+
+    if (mode === 'house' || mode === 'both') {
+      const posted = loadPosted();
+      await runHouse(postLimiter, posted);
+    }
+
+    if (postLimiter.count < MAX_POSTS_PER_RUN && (mode === 'senate' || mode === 'both')) {
+      await runSenate(postLimiter);
+    }
+
+    console.log(`Run complete. Posted ${postLimiter.count} item(s).`);
+  } finally {
+    releaseLock();
   }
-
-  const service = await resolveAtprotoService(identifier);
-  console.log(`Using ATProto PDS: ${service}`);
-
-  const bot = new Bot({ service });
-  await bot.login({
-    identifier,
-    password: process.env.BLUESKY_APP_PASSWORD,
-  });
-
-  if (mode === 'house' || mode === 'both') {
-    const posted = loadPosted();
-    await runHouse(bot, posted);
-  }
-
-  if (mode === 'senate' || mode === 'both') {
-    await runSenate(bot);
-  }
-
-  process.exit(0);
 }
 
 main().catch((err) => {
   console.error('Bill on the Floor failed:', err);
-  process.exit(1);
+  process.exitCode = 1;
 });
