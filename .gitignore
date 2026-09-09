@@ -1,3 +1,16 @@
-node_modules/ 
-.env 
-posted.json 
+node_modules/
+.env
+
+# Runtime state
+posted.json
+senate-posted.json
+senate-posted-backup.json
+
+# Runtime logs
+*.log
+
+# Local/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

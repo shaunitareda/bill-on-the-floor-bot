@@ -1,16 +1,28 @@
 {
-  "name": "botfloor",
+  "name": "bill-on-the-floor-bot",
   "version": "1.0.0",
-  "main": "index.js",
+  "description": "Bot that monitors U.S. House and Senate floor activity and posts legislative updates to Bluesky-compatible networks.",
+  "main": "bot.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node bot.js",
+    "house": "node bot.js house",
+    "senate": "node bot.js senate",
+    "both": "node bot.js both"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "congress",
+    "senate",
+    "house",
+    "bluesky",
+    "atproto",
+    "automation",
+    "civic-tech"
+  ],
+  "author": "Shaunita Reda",
   "license": "ISC",
   "dependencies": {
     "@skyware/bot": "^0.4.1",
-    "dotenv": "^17.4.2"
-  },
-  "description": ""
+    "dotenv": "^17.4.2",
+    "fast-xml-parser": "^5.10.1"
+  }
 }
